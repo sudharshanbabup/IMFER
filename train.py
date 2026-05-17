@@ -1,77 +1,48 @@
-"""
-train.py – Training loop for IMFER.
-
-Reproduces:
-  - Section IV-C: AdamW optimizer, lr scheduling, early stopping
-  - Section V:    5-run evaluation with seeds {42, 123, 256, 512, 1024}
-  - Fig. 9:      Training convergence curves
-  - Table II:    Final metrics with std dev and 95% CI
-
-Usage:
-    python train.py --dataset iemocap --device mps
-    python train.py --dataset meld --device cuda
-"""
-
-import os
 import argparse
 import json
-import time
-from typing import Dict, List, Optional
+import os
+from typing import Dict, List
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader
 
-# Local imports
-from config import IMFERConfig, IEMOCAP, MELD, EMORYNLP
-from models import IMFER, count_parameters
+from artifacts import (
+    append_run_log,
+    prepare_run_dirs,
+    save_aggregate_metrics,
+    save_metrics_json,
+    save_predictions_csv,
+)
+from config import EMORYNLP, IEMOCAP, MELD, IMFERConfig
+from data_pipeline import (
+    ConversationDataset,
+    build_label_map,
+    compute_class_weights_from_train,
+    conversation_collate,
+    extract_features_for_manifest,
+    preprocess_dataset,
+)
+from evaluate import macro_f1, weighted_f1
 from losses import IMFERLoss
-from evaluate import weighted_f1, macro_f1, per_class_f1, paired_t_test
+from models import IMFER
 
 
 def set_seed(seed: int):
-    """Set all random seeds for reproducibility (Section IV-C)."""
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    # Note: CuDNN determinism disabled for controlled variance
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
 
-def get_optimizer(model: IMFER, cfg: IMFERConfig) -> optim.Optimizer:
-    """
-    AdamW optimizer with differential learning rates (Section IV-C).
-    
-    - lr = 2e-5 for pretrained encoder parameters
-    - lr = 1e-3 for new layers (HCMA, CASGT, MCS)
-    """
-    pretrained_params = []
-    new_params = []
-
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        # In practice, encoder params would be identified by name prefix
-        # Here we treat all as "new" since encoders are pre-extracted
-        new_params.append(param)
-
-    optimizer = optim.AdamW(
-        [
-            {"params": new_params, "lr": cfg.train.lr_new},
-        ],
-        weight_decay=cfg.train.weight_decay,
-    )
-    return optimizer
+def get_optimizer(model: IMFER, cfg: IMFERConfig):
+    return optim.AdamW(model.parameters(), lr=cfg.train.lr_new, weight_decay=cfg.train.weight_decay)
 
 
 def get_scheduler(optimizer, num_training_steps: int, warmup_fraction: float):
-    """
-    Linear warmup + linear decay scheduler (Section IV-C: 10% warmup).
-    """
     num_warmup_steps = int(num_training_steps * warmup_fraction)
 
     def lr_lambda(current_step):
@@ -79,160 +50,149 @@ def get_scheduler(optimizer, num_training_steps: int, warmup_fraction: float):
             return float(current_step) / float(max(1, num_warmup_steps))
         return max(
             0.0,
-            float(num_training_steps - current_step) /
-            float(max(1, num_training_steps - num_warmup_steps))
+            float(num_training_steps - current_step) / float(max(1, num_training_steps - num_warmup_steps)),
         )
 
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def create_dummy_data(cfg: IMFERConfig, num_samples: int = 200):
-    """
-    Create synthetic data for demonstration purposes.
-    
-    In real usage, replace with actual IEMOCAP/MELD/EmoryNLP features
-    extracted from:
-      - RoBERTa-base (text)       -> (N, L, 768)
-      - wav2vec 2.0 (audio)       -> (N, T_a, 512)  
-      - 3D-ResNet (visual)        -> (N, T_v, 256)
-    """
-    L_t, T_a, T_v = 50, 30, 16  # typical sequence lengths
+def _build_loaders(cfg: IMFERConfig, batch_size: int):
+    manifest_path = preprocess_dataset(cfg.dataset, cfg.paths)
+    feature_index_path = extract_features_for_manifest(manifest_path, cfg.dataset, cfg.paths)
+    label_map = build_label_map(cfg.dataset.class_names)
 
-    H_text = torch.randn(num_samples, L_t, cfg.model.d_text)
-    H_audio = torch.randn(num_samples, T_a, cfg.model.d_audio)
-    H_visual = torch.randn(num_samples, T_v, cfg.model.d_visual)
-    labels = torch.randint(0, cfg.dataset.num_classes, (num_samples,))
-    speaker_ids = torch.randint(0, 4, (num_samples,))
+    train_ds = ConversationDataset(feature_index_path, "train", label_map)
+    val_split = "dev" if cfg.dataset.name in {"meld", "emorynlp"} else "val"
+    val_ds = ConversationDataset(feature_index_path, val_split, label_map)
+    test_ds = ConversationDataset(feature_index_path, "test", label_map)
 
-    return H_text, H_audio, H_visual, labels, speaker_ids
+    if len(val_ds) == 0:
+        val_ds = train_ds
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=conversation_collate)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=conversation_collate)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=conversation_collate)
+
+    class_weights = None
+    if cfg.dataset.name == "meld":
+        class_weights = compute_class_weights_from_train(feature_index_path, label_map)
+
+    return train_loader, val_loader, test_loader, label_map, class_weights
 
 
-def train_one_epoch(
-    model: IMFER,
-    criterion: IMFERLoss,
-    optimizer: optim.Optimizer,
-    scheduler,
-    train_data: tuple,
-    cfg: IMFERConfig,
-    device: torch.device,
-) -> Dict[str, float]:
-    """Train for one epoch."""
+def _to_device(batch: dict, device: torch.device) -> dict:
+    out = dict(batch)
+    for key in ["text", "audio", "visual", "labels", "speaker_ids", "utt_mask", "missing"]:
+        out[key] = out[key].to(device)
+    return out
+
+
+def train_one_epoch(model, criterion, optimizer, scheduler, train_loader, device):
     model.train()
-    H_text, H_audio, H_visual, labels, speaker_ids = train_data
-    B = cfg.train.batch_size
-    N = H_text.size(0)
-    indices = np.random.permutation(N)
+    total = {"loss": 0.0, "ce": 0.0, "mcs": 0.0, "align": 0.0}
+    n_batches = 0
 
-    total_loss = 0.0
-    total_ce = 0.0
-    total_mcs = 0.0
-    total_align = 0.0
-    num_batches = 0
-
-    for start in range(0, N, B):
-        idx = indices[start:start + B]
-        batch_text = H_text[idx].to(device)
-        batch_audio = H_audio[idx].to(device)
-        batch_visual = H_visual[idx].to(device)
-        batch_labels = labels[idx].to(device)
-        batch_spk = speaker_ids[idx].to(device)
-
+    for batch in train_loader:
+        batch = _to_device(batch, device)
         optimizer.zero_grad()
 
-        # Forward pass
-        out = model(batch_text, batch_audio, batch_visual, batch_spk)
+        out = model(batch["text"], batch["audio"], batch["visual"], batch["speaker_ids"], batch["utt_mask"])
+        valid = batch["utt_mask"] & (batch["labels"] >= 0)
 
-        # Compute combined loss (Eq. 7)
-        losses = criterion(
-            out["logits"],
-            batch_labels,
-            out["mcs_scores"],
-            out["modality_utts"]["text"],
-            out["modality_utts"]["audio"],
-        )
+        logits = out["logits"][valid]
+        labels = batch["labels"][valid]
+        mcs_scores = out["mcs_scores"][valid]
+        z_text = out["modality_utts"]["text"][valid]
+        z_audio = out["modality_utts"]["audio"][valid]
 
-        # Backward + optimize
+        losses = criterion(logits, labels, mcs_scores, z_text, z_audio)
         losses["total"].backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
 
-        total_loss += losses["total"].item()
-        total_ce += losses["ce"].item()
-        total_mcs += losses["mcs"].item()
-        total_align += losses["align"].item()
-        num_batches += 1
+        total["loss"] += losses["total"].item()
+        total["ce"] += losses["ce"].item()
+        total["mcs"] += losses["mcs"].item()
+        total["align"] += losses["align"].item()
+        n_batches += 1
 
-    return {
-        "loss": total_loss / num_batches,
-        "ce": total_ce / num_batches,
-        "mcs": total_mcs / num_batches,
-        "align": total_align / num_batches,
-    }
+    return {k: v / max(1, n_batches) for k, v in total.items()}
 
 
 @torch.no_grad()
-def evaluate_model(
-    model: IMFER,
-    eval_data: tuple,
-    cfg: IMFERConfig,
-    device: torch.device,
-) -> Dict[str, float]:
-    """Evaluate model on validation/test set."""
+def evaluate_model(model, loader, num_classes, device):
     model.eval()
-    H_text, H_audio, H_visual, labels, speaker_ids = eval_data
+    y_true, y_pred = [], []
+    mcs_all = []
+    pred_rows = []
 
-    # Process all at once (small datasets)
-    out = model(
-        H_text.to(device),
-        H_audio.to(device),
-        H_visual.to(device),
-        speaker_ids.to(device),
-    )
+    for batch in loader:
+        batch_cpu = batch
+        batch = _to_device(batch, device)
+        out = model(batch["text"], batch["audio"], batch["visual"], batch["speaker_ids"], batch["utt_mask"])
 
-    logits = out["logits"].cpu()
-    y_pred = logits.argmax(dim=-1).numpy()
-    y_true = labels.numpy()
+        pred = out["logits"].argmax(dim=-1).cpu()
+        labels = batch_cpu["labels"]
+        valid = batch_cpu["utt_mask"] & (labels >= 0)
 
-    wf1 = weighted_f1(y_true, y_pred, cfg.dataset.num_classes)
-    mf1 = macro_f1(y_true, y_pred, cfg.dataset.num_classes)
-    acc = 100.0 * np.mean(y_pred == y_true)
+        mcs = out["mcs_scores"].cpu()
+        for b in range(labels.shape[0]):
+            conv = batch_cpu["conversation_ids"][b]
+            for t in range(labels.shape[1]):
+                if not bool(valid[b, t]):
+                    continue
+                yt = int(labels[b, t].item())
+                yp = int(pred[b, t].item())
+                y_true.append(yt)
+                y_pred.append(yp)
+                m = mcs[b, t].tolist()
+                mcs_all.append(m)
+                pred_rows.append(
+                    {
+                        "conversation_id": conv,
+                        "turn_index": t,
+                        "y_true": yt,
+                        "y_pred": yp,
+                        "mcs_text": m[0],
+                        "mcs_audio": m[1],
+                        "mcs_visual": m[2],
+                    }
+                )
 
-    # Average MCS scores
-    mcs = out["mcs_scores"].cpu().numpy().mean(axis=0)
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
 
+    if y_true.size == 0:
+        return {
+            "wf1": 0.0,
+            "mf1": 0.0,
+            "accuracy": 0.0,
+            "mcs_text": 0.0,
+            "mcs_audio": 0.0,
+            "mcs_visual": 0.0,
+            "rows": pred_rows,
+        }
+
+    mcs_np = np.asarray(mcs_all)
     return {
-        "wf1": wf1,
-        "mf1": mf1,
-        "accuracy": acc,
-        "mcs_text": mcs[0],
-        "mcs_audio": mcs[1],
-        "mcs_visual": mcs[2],
+        "wf1": weighted_f1(y_true, y_pred, num_classes),
+        "mf1": macro_f1(y_true, y_pred, num_classes),
+        "accuracy": float(100.0 * np.mean(y_true == y_pred)),
+        "mcs_text": float(mcs_np[:, 0].mean()),
+        "mcs_audio": float(mcs_np[:, 1].mean()),
+        "mcs_visual": float(mcs_np[:, 2].mean()),
+        "rows": pred_rows,
     }
 
 
-def train_single_run(
-    seed: int,
-    cfg: IMFERConfig,
-    device: torch.device,
-    verbose: bool = True,
-) -> Dict[str, float]:
-    """
-    Complete training run with one seed.
-    
-    Follows Section IV-C:
-      - AdamW optimizer
-      - 10% linear warmup
-      - Early stopping with patience 10 on validation WF1
-    """
+def train_single_run(seed: int, cfg: IMFERConfig, device: torch.device) -> Dict[str, float]:
     set_seed(seed)
-    if verbose:
-        print(f"\n{'='*50}")
-        print(f"Run with seed={seed}")
-        print(f"{'='*50}")
+    run_dirs = prepare_run_dirs(cfg.paths.artifacts_root, cfg.dataset.name, seed)
 
-    # ── Create model ────────────────────────────────────────────────
+    train_loader, val_loader, test_loader, _, class_weights = _build_loaders(cfg, cfg.train.batch_size)
+
     model = IMFER(
         d_text=cfg.model.d_text,
         d_audio=cfg.model.d_audio,
@@ -246,126 +206,99 @@ def train_single_run(
         dropout=cfg.model.dropout,
     ).to(device)
 
-    if verbose:
-        print(f"Parameters: {count_parameters(model):,}")
+    if class_weights is not None:
+        class_weights = class_weights.to(device)
 
-    # ── Create data (replace with real data loading) ────────────────
-    train_data = create_dummy_data(cfg, num_samples=200)
-    val_data = create_dummy_data(cfg, num_samples=50)
-    test_data = create_dummy_data(cfg, num_samples=50)
-
-    # ── Setup training ──────────────────────────────────────────────
     criterion = IMFERLoss(
         num_classes=cfg.dataset.num_classes,
         lambda_1=cfg.train.lambda_1,
         lambda_2=cfg.train.lambda_2,
         tau=cfg.train.tau,
+        class_weights=class_weights,
     )
 
     optimizer = get_optimizer(model, cfg)
-    num_training_steps = (200 // cfg.train.batch_size) * cfg.train.max_epochs
+    num_training_steps = max(1, len(train_loader) * cfg.train.max_epochs)
     scheduler = get_scheduler(optimizer, num_training_steps, cfg.train.warmup_fraction)
 
-    # ── Training loop with early stopping ───────────────────────────
-    best_val_wf1 = 0.0
-    patience_counter = 0
-    history = {"train_loss": [], "val_wf1": []}
+    best_val = -1.0
+    best_state = None
+    patience = 0
 
     for epoch in range(cfg.train.max_epochs):
-        # Train
-        train_metrics = train_one_epoch(
-            model, criterion, optimizer, scheduler, train_data, cfg, device
+        train_metrics = train_one_epoch(model, criterion, optimizer, scheduler, train_loader, device)
+        val_metrics = evaluate_model(model, val_loader, cfg.dataset.num_classes, device)
+
+        line = (
+            f"epoch={epoch+1} loss={train_metrics['loss']:.4f} ce={train_metrics['ce']:.4f} "
+            f"mcs={train_metrics['mcs']:.4f} align={train_metrics['align']:.4f} val_wf1={val_metrics['wf1']:.2f}"
         )
+        append_run_log(run_dirs["logs"], line)
 
-        # Validate
-        val_metrics = evaluate_model(model, val_data, cfg, device)
-
-        history["train_loss"].append(train_metrics["loss"])
-        history["val_wf1"].append(val_metrics["wf1"])
-
-        if verbose and (epoch + 1) % 10 == 0:
-            print(f"  Epoch {epoch+1:3d}  |  loss={train_metrics['loss']:.4f}  "
-                  f"|  val_wf1={val_metrics['wf1']:.2f}%")
-
-        # Early stopping (patience = 10, Section IV-C)
-        if val_metrics["wf1"] > best_val_wf1:
-            best_val_wf1 = val_metrics["wf1"]
-            patience_counter = 0
-            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+        if val_metrics["wf1"] > best_val:
+            best_val = val_metrics["wf1"]
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            torch.save(best_state, os.path.join(run_dirs["checkpoints"], "best.pt"))
+            patience = 0
         else:
-            patience_counter += 1
-            if patience_counter >= cfg.train.patience:
-                if verbose:
-                    print(f"  Early stopping at epoch {epoch+1}")
+            patience += 1
+            if patience >= cfg.train.patience:
                 break
 
-    # ── Test evaluation ─────────────────────────────────────────────
-    model.load_state_dict(best_state)
-    test_metrics = evaluate_model(model, test_data, cfg, device)
+    if best_state is not None:
+        model.load_state_dict(best_state)
 
-    if verbose:
-        print(f"  Test WF1: {test_metrics['wf1']:.2f}%")
-        print(f"  Test MF1: {test_metrics['mf1']:.2f}%")
-        print(f"  MCS: T={test_metrics['mcs_text']:.3f}  "
-              f"A={test_metrics['mcs_audio']:.3f}  "
-              f"V={test_metrics['mcs_visual']:.3f}")
+    test_metrics = evaluate_model(model, test_loader, cfg.dataset.num_classes, device)
+    pred_path = save_predictions_csv(run_dirs["predictions"], test_metrics.pop("rows"), name="test_predictions")
+    save_metrics_json(run_dirs["metrics"], "test_metrics", test_metrics)
 
+    test_metrics["prediction_file"] = pred_path
     return test_metrics
 
 
 def run_experiment(cfg: IMFERConfig, device: torch.device):
-    """
-    Run full 5-seed experiment and report statistics.
-    
-    Reproduces Table II reporting format:
-      WF1 ± std, 95% CI, paired t-test, Cohen's d
-    """
-    print(f"\n{'#'*60}")
-    print(f"# IMFER Experiment: {cfg.dataset.name.upper()}")
-    print(f"# Seeds: {cfg.train.seeds}")
-    print(f"{'#'*60}")
-
-    all_wf1 = []
-    all_mf1 = []
-    all_acc = []
-
+    rows = []
     for seed in cfg.train.seeds:
-        metrics = train_single_run(seed, cfg, device, verbose=True)
-        all_wf1.append(metrics["wf1"])
-        all_mf1.append(metrics["mf1"])
-        all_acc.append(metrics["accuracy"])
+        result = train_single_run(seed, cfg, device)
+        rows.append(
+            {
+                "seed": seed,
+                "wf1": result["wf1"],
+                "mf1": result["mf1"],
+                "accuracy": result["accuracy"],
+                "mcs_text": result["mcs_text"],
+                "mcs_audio": result["mcs_audio"],
+                "mcs_visual": result["mcs_visual"],
+                "prediction_file": result["prediction_file"],
+            }
+        )
 
-    # ── Summary statistics ──────────────────────────────────────────
-    wf1_mean = np.mean(all_wf1)
-    wf1_std = np.std(all_wf1, ddof=1)
-    wf1_ci = 1.96 * wf1_std / np.sqrt(len(all_wf1))
+    save_aggregate_metrics(cfg.paths.artifacts_root, cfg.dataset.name, rows)
 
-    print(f"\n{'='*60}")
-    print(f"RESULTS: {cfg.dataset.name.upper()}")
-    print(f"{'='*60}")
-    print(f"  WF1:  {wf1_mean:.2f} ± {wf1_std:.2f}  (95% CI: ±{wf1_ci:.2f})")
-    print(f"  MF1:  {np.mean(all_mf1):.2f} ± {np.std(all_mf1, ddof=1):.2f}")
-    print(f"  Acc:  {np.mean(all_acc):.2f} ± {np.std(all_acc, ddof=1):.2f}")
-    print(f"  Per-run WF1: {[f'{w:.2f}' for w in all_wf1]}")
+    wf1 = np.array([r["wf1"] for r in rows], dtype=np.float64)
+    summary = {
+        "dataset": cfg.dataset.name,
+        "num_runs": len(rows),
+        "wf1_mean": float(wf1.mean()) if wf1.size else 0.0,
+        "wf1_std": float(wf1.std(ddof=1)) if wf1.size > 1 else 0.0,
+        "wf1_ci95": float(1.96 * wf1.std(ddof=1) / np.sqrt(wf1.size)) if wf1.size > 1 else 0.0,
+        "runs": rows,
+    }
 
-    return all_wf1
+    out_summary = os.path.join(cfg.paths.artifacts_root, cfg.dataset.name, "aggregate", "summary.json")
+    os.makedirs(os.path.dirname(out_summary), exist_ok=True)
+    with open(out_summary, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="IMFER Training")
-    parser.add_argument("--dataset", type=str, default="iemocap",
-                        choices=["iemocap", "meld", "emorynlp"])
-    parser.add_argument("--device", type=str, default="cpu",
-                        choices=["cpu", "cuda", "mps"])
+    parser = argparse.ArgumentParser(description="IMFER real-data training")
+    parser.add_argument("--dataset", type=str, default="iemocap", choices=["iemocap", "meld", "emorynlp"])
+    parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda", "mps"])
     args = parser.parse_args()
 
-    # Select dataset
     dataset_map = {"iemocap": IEMOCAP, "meld": MELD, "emorynlp": EMORYNLP}
     cfg = IMFERConfig(dataset=dataset_map[args.dataset])
-
-    # Select device
-    device = torch.device(args.device)
-    print(f"Using device: {device}")
-
-    # Run experiment
-    run_experiment(cfg, device)
+    run_experiment(cfg, torch.device(args.device))

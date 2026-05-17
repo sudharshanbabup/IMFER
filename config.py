@@ -23,6 +23,8 @@ class DatasetConfig:
     audio_sample_rate: int = 16000  # 16 kHz resampling (Section IV-C)
     video_fps: int = 30           # 30 fps extraction (Section IV-C)
     video_clip_frames: int = 16   # 16-frame clips (Section IV-C)
+    expected_splits: List[str] = field(default_factory=lambda: ["train", "val", "test"])
+    primary_metric: str = "wf1"
 
 
 # ── Dataset definitions (Section IV-A) ──────────────────────────────
@@ -31,6 +33,8 @@ IEMOCAP = DatasetConfig(
     num_classes=6,
     class_names=["happy", "sad", "neutral", "angry", "excited", "frustrated"],
     num_utterances=5531,
+    expected_splits=["train", "val", "test"],
+    primary_metric="wf1",
 )
 
 MELD = DatasetConfig(
@@ -41,6 +45,8 @@ MELD = DatasetConfig(
         "joy", "disgust", "anger"
     ],
     num_utterances=13708,
+    expected_splits=["train", "dev", "test"],
+    primary_metric="wf1",
 )
 
 EMORYNLP = DatasetConfig(
@@ -51,6 +57,8 @@ EMORYNLP = DatasetConfig(
         "mad", "sad", "neutral"
     ],
     num_utterances=12606,
+    expected_splits=["train", "dev", "test"],
+    primary_metric="wf1",
 )
 
 
@@ -129,6 +137,9 @@ class PathConfig:
     output_root: str = "./outputs"
     checkpoint_dir: str = "./checkpoints"
     figures_dir: str = "./figures"
+    manifests_root: str = "./data/manifests"
+    features_root: str = "./data/features"
+    artifacts_root: str = "./artifacts"
 
     # ── Pretrained model identifiers ────────────────────────────────
     roberta_model: str = "roberta-base"
@@ -149,6 +160,9 @@ class IMFERConfig:
         os.makedirs(self.paths.output_root, exist_ok=True)
         os.makedirs(self.paths.checkpoint_dir, exist_ok=True)
         os.makedirs(self.paths.figures_dir, exist_ok=True)
+        os.makedirs(self.paths.manifests_root, exist_ok=True)
+        os.makedirs(self.paths.features_root, exist_ok=True)
+        os.makedirs(self.paths.artifacts_root, exist_ok=True)
 
 
 if __name__ == "__main__":

@@ -240,6 +240,7 @@ class SpeakerGraph(nn.Module):
         self,
         speaker_ids: torch.Tensor,  # (N,) speaker ID per utterance
         num_utterances: int,
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Build sparse adjacency matrix.
@@ -250,9 +251,16 @@ class SpeakerGraph(nn.Module):
         N = num_utterances
         adj = torch.zeros(N, N, device=speaker_ids.device)
 
+        if valid_mask is None:
+            valid_mask = torch.ones(N, dtype=torch.bool, device=speaker_ids.device)
+
         for i in range(N):
+            if not bool(valid_mask[i]):
+                continue
             for j in range(max(0, i - self.W), min(N, i + self.W + 1)):
                 if i == j:
+                    continue
+                if not bool(valid_mask[j]):
                     continue
                 # Intra-speaker: always connect same speaker
                 if speaker_ids[i] == speaker_ids[j]:
@@ -347,6 +355,7 @@ class CASGT(nn.Module):
         self,
         z: torch.Tensor,           # (B, N, d_model) fused utterance features
         speaker_ids: torch.Tensor,  # (B, N) speaker IDs
+        utterance_mask: Optional[torch.Tensor] = None,  # (B, N)
     ) -> torch.Tensor:
         """
         Process conversation through graph attention + transformer.
@@ -357,11 +366,15 @@ class CASGT(nn.Module):
         B, N, D = z.shape
         outputs = []
 
+        if utterance_mask is None:
+            utterance_mask = torch.ones(B, N, dtype=torch.bool, device=z.device)
+
         for b in range(B):
             # Build adjacency for this conversation
-            adj = self.graph.build_adjacency(speaker_ids[b], N)
+            adj = self.graph.build_adjacency(speaker_ids[b], N, utterance_mask[b])
             # Graph attention
             z_gat = self.gat(z[b], adj)  # (N, d_model)
+            z_gat = torch.where(utterance_mask[b].unsqueeze(-1), z_gat, z[b])
             outputs.append(z_gat)
 
         z_gat = torch.stack(outputs, dim=0)  # (B, N, d_model)
@@ -524,10 +537,10 @@ class IMFER(nn.Module):
 
     def forward(
         self,
-        H_text: torch.Tensor,       # (B, L_t, d_text) per-utterance
-        H_audio: torch.Tensor,      # (B, T_a, d_audio)
-        H_visual: torch.Tensor,     # (B, T_v, d_visual)
-        speaker_ids: torch.Tensor,  # (B_conv, N) for CASGT
+        H_text: torch.Tensor,       # (B_conv, N, L_t, d_text)
+        H_audio: torch.Tensor,      # (B_conv, N, T_a, d_audio)
+        H_visual: torch.Tensor,     # (B_conv, N, T_v, d_visual)
+        speaker_ids: torch.Tensor,  # (B_conv, N)
         utterance_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
@@ -541,19 +554,34 @@ class IMFER(nn.Module):
             - mcs_scores: (B, 3)
             - modality_utts: dict of per-modality utterance vectors
         """
-        # ── Step 1: HCMA fusion ─────────────────────────────────────
-        z_fused, modality_utts = self.hcma(H_text, H_audio, H_visual)
-        # z_fused: (B, d_model)
+        B_conv, N, L_t, D_t = H_text.shape
+        _, _, T_a, D_a = H_audio.shape
+        _, _, T_v, D_v = H_visual.shape
 
-        # ── Step 2: CASGT (simplified: treat batch as one conversation)
-        # In practice, you'd reshape per-conversation
-        z_conv = z_fused.unsqueeze(0)        # (1, B, d_model)
-        spk = speaker_ids.unsqueeze(0) if speaker_ids.dim() == 1 else speaker_ids
-        z_hat = self.casgt(z_conv, spk)      # (1, B, d_model)
-        z_hat = z_hat.squeeze(0)             # (B, d_model)
+        if utterance_mask is None:
+            utterance_mask = torch.ones(B_conv, N, dtype=torch.bool, device=H_text.device)
+
+        # ── Step 1: HCMA fusion on flattened utterances ─────────────
+        text_flat = H_text.view(B_conv * N, L_t, D_t)
+        audio_flat = H_audio.view(B_conv * N, T_a, D_a)
+        visual_flat = H_visual.view(B_conv * N, T_v, D_v)
+        z_fused_flat, modality_utts_flat = self.hcma(text_flat, audio_flat, visual_flat)
+
+        z_fused = z_fused_flat.view(B_conv, N, self.d_model)
+        modality_utts = {
+            k: v.view(B_conv, N, self.d_model) for k, v in modality_utts_flat.items()
+        }
+
+        # ── Step 2: CASGT on true conversation tensors ──────────────
+        z_hat = self.casgt(z_fused, speaker_ids, utterance_mask)
 
         # ── Step 3: MCS prediction + attribution ────────────────────
-        logits, mcs_scores = self.mcs(z_hat, modality_utts)
+        logits_flat, mcs_scores_flat = self.mcs(
+            z_hat.view(B_conv * N, self.d_model),
+            {k: v.view(B_conv * N, self.d_model) for k, v in modality_utts.items()},
+        )
+        logits = logits_flat.view(B_conv, N, -1)
+        mcs_scores = mcs_scores_flat.view(B_conv, N, -1)
 
         return {
             "logits": logits,
@@ -576,13 +604,14 @@ def count_parameters(model: nn.Module) -> int:
 if __name__ == "__main__":
     # Quick sanity check
     model = IMFER(num_classes=6)
-    B, L_t, T_a, T_v = 4, 50, 30, 16
-    H_text = torch.randn(B, L_t, 768)
-    H_audio = torch.randn(B, T_a, 512)
-    H_visual = torch.randn(B, T_v, 256)
-    speaker_ids = torch.randint(0, 2, (B,))
+    B, N, L_t, T_a, T_v = 2, 5, 50, 30, 16
+    H_text = torch.randn(B, N, L_t, 768)
+    H_audio = torch.randn(B, N, T_a, 512)
+    H_visual = torch.randn(B, N, T_v, 256)
+    speaker_ids = torch.randint(0, 2, (B, N))
+    utt_mask = torch.ones(B, N, dtype=torch.bool)
 
-    out = model(H_text, H_audio, H_visual, speaker_ids)
+    out = model(H_text, H_audio, H_visual, speaker_ids, utt_mask)
     print(f"Logits shape:     {out['logits'].shape}")
     print(f"MCS scores shape: {out['mcs_scores'].shape}")
     print(f"MCS sum (≈1):     {out['mcs_scores'].sum(dim=-1)}")

@@ -1,91 +1,112 @@
 # IMFER: Interpretable Multimodal Fusion for Emotion Recognition
 
-Official implementation of **"IMFER: An Interpretable Multimodal Fusion Framework for Emotion Recognition in Conversational AI via Cross-Modal Attention and Explainability Mechanisms"**
+This repository now supports an artifact-driven, real-data reproducibility workflow for:
+- IEMOCAP
+- MELD
+- EmoryNLP
 
-## Architecture
+## Reproducibility target matrix
 
-IMFER comprises four components:
-1. **Modality-Specific Encoders**: RoBERTa-base (text), wav2vec 2.0 (audio), 3D-ResNet (visual)
-2. **HCMA**: Hierarchical Cross-Modal Attention with low-rank projection (92% attention FLOPs reduction)
-3. **CASGT**: Context-Aware Speaker Graph Transformer with windowed graph (O(NW) vs O(N²))
-4. **MCS**: Modality Contribution Score layer for ante-hoc interpretability
+| Dataset | Splits | Labels | Primary metrics | Paper outputs targeted |
+|---|---|---|---|---|
+| IEMOCAP | train/val/test | happy, sad, neutral, angry, excited, frustrated | WF1, MF1, Acc, per-class F1 | Table II/IV/VI/VII, Fig. 3/5/6/7/11/12 |
+| MELD | train/dev/test | neutral, surprise, fear, sadness, joy, disgust, anger | WF1, MF1, Acc | Table II, Fig. 3/9 |
+| EmoryNLP | train/dev/test | joyful, peaceful, powerful, scared, mad, sad, neutral | WF1, MF1 | Table II |
 
-## Results
+## Expected metadata input
 
-| Dataset  | WF1 (%)         | Acc (%) | #Params |
-|----------|-----------------|---------|---------|
-| IEMOCAP  | 69.87 ± 0.21    | 68.93   | 59.4M   |
-| MELD     | 62.34 ± 0.18    | 63.17   | 59.4M   |
-| EmoryNLP | 40.21 ± 0.29    | —       | 59.4M   |
+Place dataset metadata at:
+- `./data/iemocap/metadata.csv`
+- `./data/meld/metadata.csv`
+- `./data/emorynlp/metadata.csv`
 
-## Project Structure
+Each CSV should include fields mappable to:
+- `split`
+- `conversation_id`
+- `turn_index`
+- `utterance_id`
+- `speaker_id`
+- `text`
+- `audio_path`
+- `video_path`
+- `label`
 
-```
-src/
-├── config.py                 # All hyperparameters (Section IV-C)
-├── models.py                 # HCMA, CASGT, MCS, full IMFER (Section III)
-├── losses.py                 # L_CE + λ₁·L_MCS + λ₂·L_align (Eq. 7-9)
-├── train.py                  # Training loop with 5-seed evaluation
-├── evaluate.py               # WF1, MF1, AOPC, statistical tests (Section V)
-├── complexity_analysis.py    # Proposition 1 FLOPs derivation (Section III-D)
-├── robustness.py             # Noise injection + missing modality (Section V-G)
-└── visualize_results.py      # All paper figures (Figs. 3-12)
-```
+## Pipeline overview
 
-## Quick Start
+1. **Preprocess + normalize manifest** (`data_pipeline.preprocess_dataset`)  
+   Produces: `./data/manifests/<dataset>/manifest_v1.jsonl`
+2. **Feature extraction + deterministic caching** (`extract_features_for_manifest`)  
+   Produces: `./data/features/<dataset>/roberta_wav2vec2_r3d18_v1/`
+3. **Conversation dataloading** (`ConversationDataset` + `conversation_collate`)  
+   Provides padded conversation tensors, utterance masks, and missing-modality flags
+4. **Training** (`train.py`)  
+   Uses real dataloaders, true conversation CASGT batching, per-dataset labels, MELD class weighting from train priors
+5. **Artifact-driven evaluation** (`evaluate.py`, `robustness.py`, `insertion_deletion.py`, `bootstrap_analysis.py`, `visualize_results.py`)
 
+## Commands
+
+### Train
 ```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Run training (demo with synthetic data)
-cd src
-python train.py --dataset iemocap --device cpu
-
-# Generate all figures
-python visualize_results.py
-
-# Verify FLOPs analysis (Proposition 1)
-python complexity_analysis.py
-
-# Run robustness analysis
-python robustness.py
-
-# Run AOPC evaluation
-python evaluate.py
+python /home/runner/work/IMFER/IMFER/train.py --dataset iemocap --device cpu
+python /home/runner/work/IMFER/IMFER/train.py --dataset meld --device cpu
+python /home/runner/work/IMFER/IMFER/train.py --dataset emorynlp --device cpu
 ```
 
-## Key Equations
-
-| Equation | Description | File |
-|----------|-------------|------|
-| Eq. 1-2  | Token-level cross-modal attention | `models.py::TokenLevelCrossModalAttention` |
-| Eq. 3-4  | Gated utterance fusion | `models.py::HCMA` |
-| Eq. 5    | Classifier prediction | `models.py::MCSLayer` |
-| Eq. 6    | MCS attribution scores | `models.py::MCSLayer` |
-| Eq. 7    | Combined loss | `losses.py::IMFERLoss` |
-| Eq. 8    | MCS entropy regularizer | `losses.py::MCSEntropyLoss` |
-| Eq. 9    | Contrastive alignment | `losses.py::ContrastiveAlignmentLoss` |
-| Eq. 10   | Attention cost ratio | `complexity_analysis.py` |
-| Prop. 1  | HCMA complexity | `complexity_analysis.py::compute_hcma_flops` |
-
-## Hardware
-
-All experiments conducted on Apple M4 Pro (12-core CPU, 20-core GPU, 48 GB unified memory) with PyTorch 2.2 MPS backend.
-
-## Citation
-
-```bibtex
-@article{sathalla2025imfer,
-  title={IMFER: An Interpretable Multimodal Fusion Framework for Emotion 
-         Recognition in Conversational AI via Cross-Modal Attention and 
-         Explainability Mechanisms},
-  author={Sathalla, Suresh and Babu, Pandava Sudharshan and 
-          Ramegowda, Mahesh and Gottam, Omprakash},
-  year={2025}
-}
+### Aggregate evaluation from saved predictions
+```bash
+python /home/runner/work/IMFER/IMFER/evaluate.py \
+  --artifacts_root /home/runner/work/IMFER/IMFER/artifacts \
+  --dataset iemocap \
+  --num_classes 6
 ```
+
+### Bootstrap analysis
+```bash
+python /home/runner/work/IMFER/IMFER/bootstrap_analysis.py \
+  --aggregate_csv /home/runner/work/IMFER/IMFER/artifacts/iemocap/aggregate/metrics.csv
+```
+
+### Generate figures from aggregate metrics
+```bash
+python /home/runner/work/IMFER/IMFER/visualize_results.py \
+  --aggregate_csv /home/runner/work/IMFER/IMFER/artifacts/iemocap/aggregate/metrics.csv \
+  --output_dir /home/runner/work/IMFER/IMFER/figures
+```
+
+## Artifact layout
+
+```
+artifacts/
+  <dataset>/
+    seed_<seed>/
+      checkpoints/best.pt
+      predictions/test_predictions.csv
+      logs/train.log
+      metrics/test_metrics.json
+    aggregate/
+      metrics.csv
+      summary.json
+      evaluation_summary.json
+      aopc.json   # optional, if provided
+```
+
+## Validation checkpoints
+
+- Schema + split + label-map checks: `tests/test_data_pipeline.py`
+- Smoke run: one-seed training with small metadata subset
+- Full reproduction: single-seed then 5-seed
+
+## MCS formulation note
+
+`MCSLayer` computes normalized modality energies from per-modality projections for each utterance and is aligned to the modality-energy normalization definition used in the paper. Any residual approximation from cross-modal interaction terms remains documented in code comments.
+
+## Known blockers and fallback decisions
+
+- Some environments may not have full raw audio/video assets available.
+- Official split files can differ by release (`val` vs `dev` naming).
+- Certain preprocessing details in the paper may be under-specified.
+- Exact metric matching can be limited without author-released checkpoints.
 
 ## License
 
-This project is for academic research purposes.
+For academic research purposes.
