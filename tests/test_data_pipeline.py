@@ -2,19 +2,15 @@ import csv
 import os
 import tempfile
 import unittest
+import importlib.util
 
-import torch
 from config import IMFERConfig, IEMOCAP
-from data_pipeline import (
-    ConversationDataset,
-    build_label_map,
-    conversation_collate,
-    extract_features_for_manifest,
-    load_official_metadata,
-    preprocess_dataset,
-)
 
 
+TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
+
+
+@unittest.skipUnless(TORCH_AVAILABLE, "torch is required for data pipeline tests")
 class DataPipelineTests(unittest.TestCase):
     def _write_metadata(self, root: str):
         ds = os.path.join(root, "iemocap")
@@ -32,6 +28,16 @@ class DataPipelineTests(unittest.TestCase):
             writer.writerows(rows)
 
     def test_schema_split_label_and_smoke(self):
+        import torch
+        from data_pipeline import (
+            ConversationDataset,
+            build_label_map,
+            conversation_collate,
+            extract_features_for_manifest,
+            load_official_metadata,
+            preprocess_dataset,
+        )
+
         with tempfile.TemporaryDirectory() as tmp:
             self._write_metadata(tmp)
             cfg = IMFERConfig(dataset=IEMOCAP)
