@@ -1,0 +1,3 @@
+split,conversation_id,turn_index,utterance_id,speaker_id,text,audio_path,video_path,label
+train,session1_dialog1,0,utt_0001,speaker_A,"Example utterance text",./audio/session1_dialog1_utt_0001.wav,./video/session1_dialog1_utt_0001.mp4,happy
+test,session1_dialog1,1,utt_0002,speaker_B,"Another example utterance",./audio/session1_dialog1_utt_0002.wav,./video/session1_dialog1_utt_0002.mp4,sad
