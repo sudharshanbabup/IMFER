@@ -13,9 +13,19 @@ This repository now supports an artifact-driven, real-data reproducibility workf
 | MELD | train/dev/test | neutral, surprise, fear, sadness, joy, disgust, anger | WF1, MF1, Acc | Table II, Fig. 3/9 |
 | EmoryNLP | train/dev/test | joyful, peaceful, powerful, scared, mad, sad, neutral | WF1, MF1 | Table II |
 
+## Dataset sources
+
+Use the original or official dataset sources below before preparing `metadata.csv` files:
+
+- **IEMOCAP**: USC SAIL IEMOCAP release portal: `https://sail.usc.edu/iemocap/`  
+  Release/download form: `https://sail.usc.edu/iemocap/iemocap_release.htm`
+- **MELD**: official dataset repository: `https://github.com/declare-lab/MELD`  
+  Raw download noted by the dataset authors: `http://web.eecs.umich.edu/~mihalcea/downloads/MELD.Raw.tar.gz`
+- **EmoryNLP Emotion Detection**: official repository: `https://github.com/emorynlp/emotion-detection`
+
 ## Expected metadata input
 
-Place dataset metadata at:
+After downloading the datasets, convert or organize their annotations into the following normalized metadata files:
 - `./data/iemocap/metadata.csv`
 - `./data/meld/metadata.csv`
 - `./data/emorynlp/metadata.csv`
@@ -30,6 +40,12 @@ Each CSV should include fields mappable to:
 - `audio_path`
 - `video_path`
 - `label`
+
+## Dataset preparation notes
+
+- **IEMOCAP**: the release contains audio, video, transcripts, and annotations, but this repo expects you to normalize those files into a single `metadata.csv` under `./data/iemocap/`.
+- **MELD**: use the official split naming (`train`, `dev`, `test`) when generating metadata. This repo will automatically use `dev` as the validation split for MELD.
+- **EmoryNLP**: use the official split naming (`train`, `dev`, `test`) when generating metadata. If audio/video assets are unavailable in your environment, the pipeline can still run with empty paths, but missing modalities will be zero-filled during feature generation.
 
 ## Pipeline overview
 
@@ -47,30 +63,30 @@ Each CSV should include fields mappable to:
 
 ### Train
 ```bash
-python /home/runner/work/IMFER/IMFER/train.py --dataset iemocap --device cpu
-python /home/runner/work/IMFER/IMFER/train.py --dataset meld --device cpu
-python /home/runner/work/IMFER/IMFER/train.py --dataset emorynlp --device cpu
+python train.py --dataset iemocap --device cpu
+python train.py --dataset meld --device cpu
+python train.py --dataset emorynlp --device cpu
 ```
 
 ### Aggregate evaluation from saved predictions
 ```bash
-python /home/runner/work/IMFER/IMFER/evaluate.py \
-  --artifacts_root /home/runner/work/IMFER/IMFER/artifacts \
+python evaluate.py \
+  --artifacts_root ./artifacts \
   --dataset iemocap \
   --num_classes 6
 ```
 
 ### Bootstrap analysis
 ```bash
-python /home/runner/work/IMFER/IMFER/bootstrap_analysis.py \
-  --aggregate_csv /home/runner/work/IMFER/IMFER/artifacts/iemocap/aggregate/metrics.csv
+python bootstrap_analysis.py \
+  --aggregate_csv ./artifacts/iemocap/aggregate/metrics.csv
 ```
 
 ### Generate figures from aggregate metrics
 ```bash
-python /home/runner/work/IMFER/IMFER/visualize_results.py \
-  --aggregate_csv /home/runner/work/IMFER/IMFER/artifacts/iemocap/aggregate/metrics.csv \
-  --output_dir /home/runner/work/IMFER/IMFER/figures
+python visualize_results.py \
+  --aggregate_csv ./artifacts/iemocap/aggregate/metrics.csv \
+  --output_dir ./figures
 ```
 
 ## Artifact layout
@@ -98,7 +114,7 @@ artifacts/
 
 ## MCS formulation note
 
-`MCSLayer` computes normalized modality energies from per-modality projections for each utterance and is aligned to the modality-energy normalization definition used in the paper. Any residual approximation from cross-modal interaction terms remains documented in code comments.
+`MCSLayer` computes normalized modality energies from per-modality projections for each utterance and is aligned to the modality-energy normalization definition used in the paper. Any residual approximation error comes from interaction terms introduced by gating and contextualization.
 
 ## Known blockers and fallback decisions
 
